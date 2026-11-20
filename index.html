@@ -1,0 +1,416 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Read Aloud</title>
+<style>
+  :root { --bg:#f7f7f5; --card:#fff; --ink:#1a1a1a; --muted:#6b6b6b; --line:#e4e4e0; --accent:#2f6fed; --hl:#fff3b0; }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg:#141414; --card:#1e1e1e; --ink:#ececec; --muted:#9a9a9a; --line:#2e2e2e; --accent:#6b9bff; --hl:#4a4320; }
+  }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--ink); font:16px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; }
+  main { max-width:720px; margin:0 auto; padding:32px 16px 80px; }
+  h1 { font-size:22px; margin:0 0 16px; }
+  .row { display:flex; gap:8px; flex-wrap:wrap; }
+  input { flex:1 1 260px; min-width:0; padding:12px; border:1px solid var(--line); border-radius:8px; background:var(--card); color:var(--ink); font-size:16px; }
+  button, select { padding:10px 14px; border:1px solid var(--line); border-radius:8px; background:var(--card); color:var(--ink); font-size:15px; cursor:pointer; }
+  button.primary { background:var(--accent); border-color:var(--accent); color:#fff; }
+  button:disabled { opacity:.5; cursor:default; }
+  .controls { margin-top:12px; align-items:center; }
+  .controls label { color:var(--muted); font-size:14px; display:flex; align-items:center; gap:6px; }
+  select { max-width:240px; }
+  #status { color:var(--muted); margin:14px 0; min-height:1.6em; }
+  #status.err { color:#d33; }
+  #model { color:var(--muted); font-size:13px; margin-top:8px; min-height:1.4em; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:10px; padding:20px; }
+  article { display:none; }
+  article h2 { margin:0 0 4px; font-size:20px; }
+  article .by { color:var(--muted); font-size:14px; margin-bottom:14px; }
+  article p { margin:0 0 12px; }
+  .s { cursor:pointer; border-radius:4px; padding:2px 4px; margin-left:-4px; margin-right:-4px; }
+  .s.now { background:var(--hl); }
+</style>
+</head>
+<body>
+<main>
+  <h1>🔊 Read Aloud</h1>
+
+  <form id="f" class="row">
+    <input id="url" type="url" placeholder="Paste an X post or article link…" required>
+    <button class="primary" id="go">Read it</button>
+  </form>
+
+  <div class="row controls">
+    <button id="play" disabled>▶ Play</button>
+    <button id="stop" disabled>⏹ Stop</button>
+    <label>Engine <select id="engine">
+      <option value="ai">AI voice (natural)</option>
+      <option value="device">Device voice (instant)</option>
+    </select></label>
+    <label>Voice <select id="voice"></select></label>
+    <label>Speed <select id="rate">
+      <option>0.9</option><option selected>1</option><option>1.15</option><option>1.25</option><option>1.5</option><option>1.75</option><option>2</option>
+    </select></label>
+  </div>
+  <div id="model"></div>
+
+  <div id="status"></div>
+  <article id="out" class="card"><h2 id="title"></h2><div class="by" id="by"></div><div id="body"></div></article>
+</main>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const store = {
+  get: (k) => { try { return localStorage.getItem(k); } catch { return null; } },
+  set: (k, v) => { try { localStorage.setItem(k, v); } catch {} },
+};
+
+// ================= Voices =================
+// "ai" = Kokoro, a free open-source voice model that runs inside your browser.
+// "device" = the voices built into your phone/computer.
+const AI_VOICES = [
+  { id: "af_heart", name: "Heart (warm female) ★" },
+  { id: "af_bella", name: "Bella (lively female) ★" },
+  { id: "af_nicole", name: "Nicole (soft female)" },
+  { id: "bf_emma", name: "Emma (British female)" },
+  { id: "am_michael", name: "Michael (male)" },
+  { id: "am_fenrir", name: "Fenrir (deep male)" },
+  { id: "am_puck", name: "Puck (upbeat male)" },
+  { id: "bm_george", name: "George (British male)" },
+];
+const synth = window.speechSynthesis;
+const engine = () => $("engine").value;
+
+function loadVoices() {
+  const saved = store.get("voice_" + engine());
+  let list;
+  if (engine() === "ai") {
+    list = AI_VOICES;
+  } else {
+    // Put the better-sounding device voices first
+    const good = /natural|neural|premium|enhanced|google|siri|samantha|ava|zoe/i;
+    list = (synth?.getVoices() || []).filter(v => v.lang.startsWith("en"))
+      .sort((a, b) => good.test(b.name) - good.test(a.name) || a.name.localeCompare(b.name))
+      .map(v => ({ id: v.name, name: v.name }));
+  }
+  $("voice").innerHTML = list.map(v =>
+    `<option value="${v.id}" ${v.id === saved ? "selected" : ""}>${v.name}</option>`).join("");
+}
+$("engine").value = store.get("engine") || "ai";
+$("engine").onchange = () => {
+  store.set("engine", engine());
+  loadVoices(); cache.clear();
+  if (engine() === "ai") startModel();
+  $("model").textContent = engine() === "ai" ? modelMsg : "";
+  if (chunks.length) { const was = playing; rechunk(); if (was) restartAt(0); }
+};
+$("voice").onchange = () => { store.set("voice_" + engine(), $("voice").value); cache.clear(); if (playing) restartAt(idx); };
+$("rate").onchange = () => { audio.playbackRate = rate(); if (engine() === "device" && playing) restartAt(idx); };
+const rate = () => parseFloat($("rate").value);
+if (synth) synth.onvoiceschanged = () => { if (engine() === "device") loadVoices(); };
+loadVoices();
+
+// ================= AI voice model (runs in a background worker) =================
+const KOKORO_URL = "https://cdn.jsdelivr.net/npm/kokoro-js@1.2.1/dist/kokoro.web.js";
+const workerSrc = `
+import { KokoroTTS } from "${KOKORO_URL}";
+let tts = null;
+const ready = KokoroTTS.from_pretrained("onnx-community/Kokoro-82M-v1.0-ONNX", {
+  dtype: "q8", device: "wasm",
+  progress_callback: (p) => {
+    if (p.status === "progress" && /onnx/.test(p.file || "")) postMessage({ type: "progress", pct: Math.round(p.progress || 0) });
+  },
+}).then((t) => { tts = t; postMessage({ type: "ready" }); })
+  .catch((e) => postMessage({ type: "fatal", error: String(e && e.message || e) }));
+
+function toWav(samples, rate) {
+  const buf = new ArrayBuffer(44 + samples.length * 2), v = new DataView(buf);
+  const w = (o, s) => { for (let i = 0; i < s.length; i++) v.setUint8(o + i, s.charCodeAt(i)); };
+  w(0, "RIFF"); v.setUint32(4, 36 + samples.length * 2, true); w(8, "WAVE"); w(12, "fmt ");
+  v.setUint32(16, 16, true); v.setUint16(20, 1, true); v.setUint16(22, 1, true);
+  v.setUint32(24, rate, true); v.setUint32(28, rate * 2, true); v.setUint16(32, 2, true); v.setUint16(34, 16, true);
+  w(36, "data"); v.setUint32(40, samples.length * 2, true);
+  for (let i = 0; i < samples.length; i++) {
+    const s = Math.max(-1, Math.min(1, samples[i]));
+    v.setInt16(44 + i * 2, s < 0 ? s * 0x8000 : s * 0x7fff, true);
+  }
+  return buf;
+}
+
+self.onmessage = async ({ data: { id, text, voice } }) => {
+  try {
+    await ready;
+    if (!tts) throw new Error("The AI voice failed to load.");
+    const parts = []; let rate = 24000, n = 0;
+    // stream() splits text into sentences so long chunks don't get cut off
+    for await (const { audio } of tts.stream(text, { voice })) {
+      parts.push(audio.audio); rate = audio.sampling_rate; n += audio.audio.length;
+    }
+    const all = new Float32Array(n); let o = 0;
+    for (const p of parts) { all.set(p, o); o += p.length; }
+    const wav = toWav(all, rate);
+    postMessage({ id, wav }, [wav]);
+  } catch (e) {
+    postMessage({ id, error: String(e && e.message || e) });
+  }
+};`;
+
+let worker = null, modelMsg = "", jobId = 0;
+const jobs = new Map();
+function setModel(msg) { modelMsg = msg; if (engine() === "ai") $("model").textContent = msg; }
+function startModel() {
+  if (worker) return;
+  setModel("Loading AI voice… (first time downloads ~90 MB, then it's saved)");
+  worker = new Worker(URL.createObjectURL(new Blob([workerSrc], { type: "text/javascript" })), { type: "module" });
+  worker.onmessage = ({ data }) => {
+    if (data.type === "progress") setModel(`Downloading AI voice… ${data.pct}% (one time only)`);
+    else if (data.type === "ready") setModel("AI voice ready. Runs on your device. Free, no account.");
+    else if (data.type === "fatal") console.warn("AI voice load error:", data.error), setModel("AI voice couldn't load on this device. Switch Engine to “Device voice”.");
+    else if (jobs.has(data.id)) {
+      const { resolve, reject } = jobs.get(data.id); jobs.delete(data.id);
+      data.error ? reject(new Error(data.error)) : resolve(URL.createObjectURL(new Blob([data.wav], { type: "audio/wav" })));
+    }
+  };
+  worker.onerror = () => setModel("AI voice couldn't load on this device. Switch Engine to “Device voice”.");
+}
+function aiSpeak(text) {
+  startModel();
+  return new Promise((resolve, reject) => {
+    const id = ++jobId;
+    jobs.set(id, { resolve, reject });
+    worker.postMessage({ id, text, voice: $("voice").value });
+  });
+}
+if (engine() === "ai") startModel();
+
+// ================= Getting the text =================
+function getTweetId(url) {
+  const m = url.match(/(?:x|twitter)\.com\/[^/]+\/(?:status|article)\/(\d+)/i);
+  return m ? m[1] : null;
+}
+
+// X posts: FxTwitter's free public API (X itself blocks this kind of access)
+async function extractTweet(id) {
+  const r = await fetch(`https://api.fxtwitter.com/status/${id}`);
+  if (!r.ok) throw new Error(`Couldn't load that post (HTTP ${r.status}). It may be private or deleted.`);
+  const t = (await r.json()).tweet;
+  if (!t) throw new Error("Post not found.");
+  const author = t.author?.name || t.author?.screen_name || "Unknown";
+  let title = `Post by ${author}`, body = "";
+  if (t.article) { // long-form X Articles
+    title = t.article.title || title;
+    body = (t.article.content?.blocks || []).map(b => b.text).filter(Boolean).join("\n\n") || t.article.preview_text || "";
+  }
+  if (!body) body = t.raw_text?.text || t.text || "";
+  if (t.quote?.text) body += `\n\nQuoting ${t.quote.author?.name || "another post"}: ${t.quote.text}`;
+  return { title, byline: author, text: cleanForSpeech(body) };
+}
+
+// Articles: Jina Reader fetches the page and returns clean article text
+async function extractArticle(url) {
+  const r = await fetch("https://r.jina.ai/" + url, { headers: { Accept: "application/json", "X-Retain-Images": "none" } });
+  if (r.status === 429) throw new Error("Too many requests to the article reader. Wait a minute and try again.");
+  if (!r.ok) throw new Error(`Couldn't read that page (HTTP ${r.status}). It may be paywalled or block readers.`);
+  const d = (await r.json()).data || {};
+  if (!d.content?.trim()) throw new Error("Couldn't find article text on that page.");
+  let host = ""; try { host = new URL(url).hostname.replace(/^www\./, ""); } catch {}
+  const title = d.title || "Article";
+  let text = cleanForSpeech(markdownToText(d.content));
+  // don't read the title twice if the article body starts with it
+  const firstLine = text.split("\n")[0].trim();
+  if (firstLine.toLowerCase() === title.trim().toLowerCase()) text = text.slice(firstLine.length).trim();
+  return { title, byline: host, text };
+}
+
+// Jina returns Markdown; strip the symbols so they aren't read aloud
+function markdownToText(md) {
+  return md
+    .replace(/```[\s\S]*?```/g, "")              // code blocks
+    .replace(/!\[[^\]]*\]\([^)]*\)/g, "")         // images
+    .replace(/\[([^\]]*)\]\([^)]*\)/g, "$1")      // links -> link text
+    .replace(/^\s{0,3}#{1,6}\s*/gm, "")           // headings
+    .replace(/^\s*[-*+]\s+/gm, "")                // bullets
+    .replace(/^\s*>\s?/gm, "")                    // quotes
+    .replace(/^\s*([-*_=]\s*){3,}$/gm, "")        // horizontal rules / underlines
+    .replace(/(\*\*|__|\*|_|`)/g, "")             // bold / italic / code marks
+    .replace(/\|/g, " ");                         // table pipes
+}
+
+function cleanForSpeech(s) {
+  return s.replace(/https?:\/\/\S+/g, "").replace(/[ \t]+/g, " ").replace(/\n\s*\n+/g, "\n\n").trim();
+}
+
+// ================= Fetch + render =================
+let doc = null, chunks = [], idx = 0, playing = false, paused = false, runId = 0;
+const audio = new Audio();
+const cache = new Map(); // chunk index -> Promise<audio URL>
+
+async function load(url) {
+  stop();
+  setStatus("Fetching…");
+  $("go").disabled = true;
+  try {
+    const id = getTweetId(url);
+    doc = id ? await extractTweet(id) : await extractArticle(url);
+    if (!doc.text) throw new Error("No text found.");
+    render();
+    setStatus(`~${Math.ceil(doc.text.split(/\s+/).length / 160)} min listen · tap any paragraph to jump`);
+    restartAt(0);
+  } catch (err) {
+    setStatus(err.message === "Failed to fetch" ? "Network error. Check your connection and try again." : err.message, true);
+  } finally {
+    $("go").disabled = false;
+  }
+}
+$("f").onsubmit = (e) => { e.preventDefault(); load($("url").value.trim()); };
+
+function render() {
+  $("title").textContent = doc.title;
+  $("by").textContent = doc.byline || "";
+  const body = $("body");
+  body.innerHTML = "";
+  for (const para of doc.text.split(/\n+/).map(p => p.trim()).filter(Boolean)) {
+    for (const piece of splitLong(para, 1000)) {
+      const p = document.createElement("p");
+      p.className = "s";
+      p.textContent = piece;
+      body.appendChild(p);
+    }
+  }
+  $("out").style.display = "block";
+  rechunk();
+}
+
+// Group paragraphs into chunks. AI chunks are small so audio starts fast.
+function rechunk() {
+  cache.clear();
+  const max = engine() === "ai" ? 500 : 1200;
+  chunks = [{ text: doc.title + ".", els: [$("title")] }];
+  let cur = null;
+  for (const p of $("body").children) {
+    const t = p.textContent;
+    if (!cur || cur.text.length + t.length > max) { cur = { text: "", els: [] }; chunks.push(cur); }
+    cur.text += (cur.text ? "\n\n" : "") + t;
+    cur.els.push(p);
+    const i = chunks.length - 1;
+    p.onclick = () => restartAt(i);
+  }
+  $("title").onclick = () => restartAt(0);
+}
+
+function splitLong(s, max) {
+  if (s.length <= max) return [s];
+  const out = []; let buf = "";
+  for (const sent of sentences(s)) {
+    if (buf.length + sent.length > max && buf) { out.push(buf.trim()); buf = ""; }
+    buf += sent;
+  }
+  if (buf.trim()) out.push(buf.trim());
+  return out;
+}
+const sentences = (s) => s.match(/[^.!?…]+[.!?…]+["'”’)\]]*\s*|[^.!?…]+$/g) || [s];
+
+// ================= Playback =================
+function getAudio(i) {
+  if (!cache.has(i)) {
+    const p = aiSpeak(chunks[i].text);
+    p.catch(() => cache.delete(i));
+    cache.set(i, p);
+  }
+  return cache.get(i);
+}
+
+// Device voice: speak sentence by sentence (avoids a Chrome bug that cuts off long speech)
+async function deviceSpeak(text, myRun) {
+  const v = synth.getVoices().find(v => v.name === $("voice").value) || null;
+  for (const s of sentences(text.replace(/\n+/g, " "))) {
+    if (myRun !== runId || !s.trim()) continue;
+    await new Promise(res => {
+      const u = new SpeechSynthesisUtterance(s.trim());
+      u.voice = v; u.rate = rate();
+      u.onend = u.onerror = res;
+      synth.speak(u);
+    });
+  }
+}
+
+async function playFrom(i, myRun) {
+  while (i < chunks.length && myRun === runId) {
+    idx = i;
+    highlight(i);
+    if (engine() === "device") {
+      if (!synth) { setStatus("This browser has no built-in voices.", true); return stop(); }
+      await deviceSpeak(chunks[i].text, myRun);
+    } else {
+      let url;
+      try {
+        if (!cache.has(i)) setStatus("Generating voice…");
+        url = await getAudio(i);
+      } catch (e) { setStatus(e.message, true); return stop(); }
+      if (myRun !== runId) return;
+      setStatus("");
+      if (i + 1 < chunks.length) getAudio(i + 1); // make the next chunk while this one plays
+      audio.src = url;
+      audio.playbackRate = rate();
+      try { await audio.play(); }
+      catch { setStatus("Tap ▶ Play to start."); } // phones block autoplay until you tap
+      await new Promise(res => { audio.onended = res; audio.onerror = res; audio.onabort = res; });
+    }
+    i++;
+  }
+  if (myRun === runId) { stop(); setStatus("Done."); }
+}
+
+function restartAt(i) {
+  if (!chunks.length) return;
+  runId++;
+  audio.onabort?.(); audio.pause();
+  synth?.cancel();
+  playing = true; paused = false;
+  updateButtons();
+  playFrom(i, runId);
+}
+
+function stop() {
+  runId++;
+  playing = false; paused = false;
+  audio.pause(); audio.onended?.();
+  synth?.cancel();
+  document.querySelectorAll(".now").forEach(el => el.classList.remove("now"));
+  updateButtons();
+}
+
+function highlight(i) {
+  document.querySelectorAll(".now").forEach(el => el.classList.remove("now"));
+  chunks[i].els.forEach(el => el.classList.add("now"));
+  chunks[i].els[0].scrollIntoView({ block: "center", behavior: "smooth" });
+}
+
+$("play").onclick = () => {
+  if (!playing) return restartAt(idx);
+  if (engine() === "device") {
+    paused ? synth.resume() : synth.pause();
+    paused = !paused;
+  } else {
+    if (audio.paused) { audio.play(); paused = false; } else { audio.pause(); paused = true; }
+  }
+  updateButtons();
+};
+audio.onplay = () => { paused = false; updateButtons(); };
+$("stop").onclick = () => { stop(); idx = 0; };
+
+function updateButtons() {
+  $("play").disabled = !chunks.length;
+  $("stop").disabled = !playing;
+  $("play").textContent = playing && !paused ? "⏸ Pause" : "▶ Play";
+}
+function setStatus(msg, err) { $("status").textContent = msg; $("status").className = err ? "err" : ""; }
+
+// Open with ?url=... to load a link directly (handy for bookmarklets / phone shortcuts)
+const q = new URLSearchParams(location.search).get("url");
+if (q) { $("url").value = q; load(q); }
+</script>
+</body>
+</html>
